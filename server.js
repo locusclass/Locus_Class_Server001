@@ -5,74 +5,88 @@ const url = require('url');
 const PORT = process.env.PORT || 8080;
 
 const server = http.createServer((req, res) => {
-    // Railway Health Check
     if (req.url === '/healthz') {
         res.writeHead(200);
         return res.end('OK');
     }
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('PRESENCE_CORE_V3_ACTIVE');
+    res.writeHead(200);
+    res.end('PRESENCE_SIGNALING_v3_RUNNING');
 });
 
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws, req) => {
-    try {
-        const parameters = url.parse(req.url, true).query;
-        const addressId = parameters.address;
+    const parameters = url.parse(req.url, true).query;
+    const addressId = parameters.address;
 
-        if (!addressId) return ws.terminate();
+    if (!addressId) {
+        return ws.terminate();
+    }
 
-        ws.locusAddress = addressId;
-        ws.isAlive = true;
+    ws.locusAddress = addressId;
+    ws.isAlive = true;
 
-        // Grouping peers for 1-to-1 WebRTC
-        const peers = Array.from(wss.clients).filter(c => 
-            c !== ws && c.locusAddress === addressId && c.readyState === WebSocket.OPEN
-        );
+    // 1. Identify Peers in the same room
+    const peers = Array.from(wss.clients).filter(c => 
+        c !== ws && c.locusAddress === addressId && c.readyState === WebSocket.OPEN
+    );
 
-        if (peers.length === 0) {
-            ws.role = 'polite';
-        } else if (peers.length === 1) {
-            ws.role = 'initiator';
-            ws.send(JSON.stringify({ type: 'ready', role: 'initiator' }));
-            peers[0].send(JSON.stringify({ type: 'ready', role: 'polite' }));
-        } else {
-            ws.send(JSON.stringify({ type: 'error', message: 'ROOM_FULL' }));
-            return ws.terminate();
-        }
+    // 2. Role Assignment & Room Management
+    if (peers.length === 0) {
+        // First person in: Wait as polite peer
+        ws.role = 'polite';
+    } else if (peers.length === 1) {
+        // Second person in: Become the initiator
+        ws.role = 'initiator';
+        
+        // Signal BOTH to start their engines
+        ws.send(JSON.stringify({ type: 'ready', role: 'initiator' }));
+        peers[0].send(JSON.stringify({ type: 'ready', role: 'polite' }));
+    } else {
+        // Room full (Maximum 2 people)
+        ws.send(JSON.stringify({ type: 'collapse', reason: 'ROOM_FULL' }));
+        return ws.terminate();
+    }
 
-        ws.on('pong', () => { ws.isAlive = true; });
+    // 3. Signal Relay Logic
+    ws.on('message', (rawData) => {
+        try {
+            const msg = JSON.parse(rawData);
+            
+            // Heartbeat response
+            if (msg.type === 'ping') {
+                return ws.send(JSON.stringify({ type: 'pong' }));
+            }
 
-        ws.on('message', (rawData) => {
-            try {
-                const msg = JSON.parse(rawData);
-                if (msg.type === 'ping') return ws.send(JSON.stringify({ type: 'pong' }));
-
-                // Relay logic
-                wss.clients.forEach(client => {
-                    if (client.locusAddress === addressId && client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify(msg));
-                    }
-                });
-            } catch (e) { }
-        });
-
-        ws.on('close', () => {
+            // Broadcast to the other peer in the room
             wss.clients.forEach(client => {
-                if (client.locusAddress === addressId && client !== ws) {
-                    client.send(JSON.stringify({ type: 'collapse', reason: 'peer_lost' }));
+                if (client !== ws && 
+                    client.locusAddress === addressId && 
+                    client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify(msg));
                 }
             });
-        });
+        } catch (e) {
+            console.error("Relay Error:", e);
+        }
+    });
 
-    } catch (e) { ws.terminate(); }
+    ws.on('pong', () => { ws.isAlive = true; });
+
+    ws.on('close', () => {
+        // Notify the remaining peer that the connection collapsed
+        wss.clients.forEach(client => {
+            if (client !== ws && client.locusAddress === addressId) {
+                client.send(JSON.stringify({ type: 'collapse', reason: 'peer_lost' }));
+            }
+        });
+    });
 });
 
-// Vital for Android 9-14: Kills ghost sockets to free up ports
-setInterval(() => {
+// Keep-alive loop to prevent Railway/Mobile timeouts
+const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
-        if (!ws.isAlive) return ws.terminate();
+        if (ws.isAlive === false) return ws.terminate();
         ws.isAlive = false;
         ws.ping();
     });
