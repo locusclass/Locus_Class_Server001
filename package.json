@@ -1,15 +1,18 @@
 {
   "name": "presence-signal-core",
   "version": "1.0.0",
-  "description": "Heavyweight signaling server for Presence",
+  "description": "Cross-version signaling relay for Presence",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.16.0"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "author": "Presence",
+  "license": "ISC"
 }
