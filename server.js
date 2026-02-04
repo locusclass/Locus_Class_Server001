@@ -5,88 +5,82 @@ const url = require('url');
 const PORT = process.env.PORT || 8080;
 
 const server = http.createServer((req, res) => {
+    // Railway Health Check
     if (req.url === '/healthz') {
         res.writeHead(200);
         return res.end('OK');
     }
-    res.writeHead(200);
-    res.end('PRESENCE_SIGNALING_v3_RUNNING');
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('PRESENCE_CORE_V3_ACTIVE');
 });
 
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws, req) => {
-    const parameters = url.parse(req.url, true).query;
-    const addressId = parameters.address;
+    try {
+        const parameters = url.parse(req.url, true).query;
+        const addressId = parameters.address;
 
-    if (!addressId) {
-        return ws.terminate();
-    }
+        if (!addressId) return ws.terminate();
 
-    ws.locusAddress = addressId;
-    ws.isAlive = true;
+        ws.locusAddress = addressId;
+        ws.isAlive = true;
 
-    // 1. Identify Peers in the same room
-    const peers = Array.from(wss.clients).filter(c => 
-        c !== ws && c.locusAddress === addressId && c.readyState === WebSocket.OPEN
-    );
+        // Grouping peers for 1-to-1 WebRTC
+        const peers = Array.from(wss.clients).filter(c => 
+            c !== ws && c.locusAddress === addressId && c.readyState === WebSocket.OPEN
+        );
 
-    // 2. Role Assignment & Room Management
-    if (peers.length === 0) {
-        // First person in: Wait as polite peer
-        ws.role = 'polite';
-    } else if (peers.length === 1) {
-        // Second person in: Become the initiator
-        ws.role = 'initiator';
-        
-        // Signal BOTH to start their engines
-        ws.send(JSON.stringify({ type: 'ready', role: 'initiator' }));
-        peers[0].send(JSON.stringify({ type: 'ready', role: 'polite' }));
-    } else {
-        // Room full (Maximum 2 people)
-        ws.send(JSON.stringify({ type: 'collapse', reason: 'ROOM_FULL' }));
-        return ws.terminate();
-    }
-
-    // 3. Signal Relay Logic
-    ws.on('message', (rawData) => {
-        try {
-            const msg = JSON.parse(rawData);
+        if (peers.length === 0) {
+            // First peer is always "polite" by default until initiator arrives
+            ws.role = 'polite';
+        } else if (peers.length === 1) {
+            // Second peer is the initiator
+            ws.role = 'initiator';
             
-            // Heartbeat response
-            if (msg.type === 'ping') {
-                return ws.send(JSON.stringify({ type: 'pong' }));
-            }
+            // Trigger handshake for both
+            ws.send(JSON.stringify({ type: 'ready', role: 'initiator' }));
+            peers[0].send(JSON.stringify({ type: 'ready', role: 'polite' }));
+        } else {
+            ws.send(JSON.stringify({ type: 'collapse', reason: 'ROOM_FULL' }));
+            return ws.terminate();
+        }
 
-            // Broadcast to the other peer in the room
+        ws.on('pong', () => { ws.isAlive = true; });
+
+        ws.on('message', (rawData) => {
+            try {
+                const msg = JSON.parse(rawData);
+                
+                // Low-latency Heartbeat
+                if (msg.type === 'ping') return ws.send(JSON.stringify({ type: 'pong' }));
+
+                // Relay WebRTC/Text/Reveal signals to the peer
+                wss.clients.forEach(client => {
+                    if (client.locusAddress === addressId && client !== ws && client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify(msg));
+                    }
+                });
+            } catch (e) { }
+        });
+
+        ws.on('close', () => {
             wss.clients.forEach(client => {
-                if (client !== ws && 
-                    client.locusAddress === addressId && 
-                    client.readyState === WebSocket.OPEN) {
-                    client.send(JSON.stringify(msg));
+                if (client.locusAddress === addressId && client !== ws) {
+                    client.send(JSON.stringify({ type: 'collapse', reason: 'peer_lost' }));
                 }
             });
-        } catch (e) {
-            console.error("Relay Error:", e);
-        }
-    });
-
-    ws.on('pong', () => { ws.isAlive = true; });
-
-    ws.on('close', () => {
-        // Notify the remaining peer that the connection collapsed
-        wss.clients.forEach(client => {
-            if (client !== ws && client.locusAddress === addressId) {
-                client.send(JSON.stringify({ type: 'collapse', reason: 'peer_lost' }));
-            }
         });
-    });
+
+    } catch (e) { 
+        ws.terminate(); 
+    }
 });
 
-// Keep-alive loop to prevent Railway/Mobile timeouts
-const interval = setInterval(() => {
+// Vital for Android stability: Kills ghost sockets
+setInterval(() => {
     wss.clients.forEach((ws) => {
-        if (ws.isAlive === false) return ws.terminate();
+        if (!ws.isAlive) return ws.terminate();
         ws.isAlive = false;
         ws.ping();
     });
