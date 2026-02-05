@@ -4,16 +4,22 @@ const url = require('url');
 
 const PORT = process.env.PORT || 8080;
 
-// Room management for O(1) lookups
+/**
+ * Room management: Map<addressId, Set<WebSocket>>
+ * Provides O(1) lookup for peer discovery.
+ */
 const rooms = new Map();
 
+/**
+ * HTTP Server for Health Checks
+ */
 const server = http.createServer((req, res) => {
-    if (req.url === '/healthz') {
+    if (req.url === '/healthz' || req.url === '/health') {
         res.writeHead(200);
         return res.end('OK');
     }
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('PRESENCE_CORE_V3_ACTIVE');
+    res.end('PRESENCE_SIGNAL_BRIDGE_V3_ACTIVE');
 });
 
 const wss = new WebSocket.Server({ server });
@@ -22,37 +28,50 @@ wss.on('connection', (ws, req) => {
     const parameters = url.parse(req.url, true).query;
     const addressId = parameters.address;
 
-    if (!addressId) return ws.terminate();
+    // Safety: Close connection if no address provided
+    if (!addressId) {
+        console.log("Rejected: No Address ID");
+        return ws.terminate();
+    }
 
     ws.locusAddress = addressId;
     ws.isAlive = true;
 
-    // Initialize room if it doesn't exist
+    // Initialize room if first arrival
     if (!rooms.has(addressId)) {
         rooms.set(addressId, new Set());
     }
     
     const room = rooms.get(addressId);
 
+    // Limit: Max 2 peers per address
     if (room.size >= 2) {
         ws.send(JSON.stringify({ type: 'collapse', reason: 'ROOM_FULL' }));
         return ws.terminate();
     }
 
     room.add(ws);
+    console.log(`Peer joined [${addressId}]. Room size: ${room.size}`);
 
-    // Determine roles: First is polite, second is initiator
+    /**
+     * ROLE ASSIGNMENT:
+     * First peer to join is the 'polite' peer (Receiver).
+     * Second peer to join is the 'initiator' (Caller).
+     */
     if (room.size === 1) {
         ws.role = 'polite';
     } else {
         ws.role = 'initiator';
-        // Notify both peers to start the handshake simultaneously
-        const peerList = Array.from(room);
-        peerList.forEach(client => {
-            client.send(JSON.stringify({ 
-                type: 'ready', 
-                role: client.role 
-            }));
+
+        // Notify both peers to start handshaking
+        // Initiator will wait 200ms (client-side) before sending offer
+        room.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({ 
+                    type: 'ready', 
+                    role: client.role 
+                }));
+            }
         });
     }
 
@@ -60,17 +79,16 @@ wss.on('connection', (ws, req) => {
 
     ws.on('message', (rawData) => {
         try {
-            const msg = JSON.parse(rawData);
-            
-            // Internal Heartbeat
-            if (msg.type === 'ping') {
+            // Check for heartbeat/ping
+            const dataStr = rawData.toString();
+            if (dataStr.includes('"type":"ping"')) {
                 return ws.send(JSON.stringify({ type: 'pong' }));
             }
 
-            // Target relay: Only send to the OTHER person in this specific room
+            // RELAY: Send message to the other person in the room
             room.forEach(client => {
                 if (client !== ws && client.readyState === WebSocket.OPEN) {
-                    client.send(rawData); // Send raw buffer for speed
+                    client.send(rawData); 
                 }
             });
         } catch (e) {
@@ -80,23 +98,37 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
         room.delete(ws);
-        // Notify the remaining peer
+        console.log(`Peer left [${addressId}]. Remaining: ${room.size}`);
+
+        // Notify remaining peer to collapse the UI
         room.forEach(client => {
-            client.send(JSON.stringify({ type: 'collapse', reason: 'peer_lost' }));
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({ type: 'collapse', reason: 'peer_lost' }));
+            }
         });
-        // Clean up empty rooms
+
+        // Clean up memory if room is empty
         if (room.size === 0) {
             rooms.delete(addressId);
         }
     });
 
-    ws.on('error', () => ws.terminate());
+    ws.on('error', (err) => {
+        console.error("WS Error:", err);
+        ws.terminate();
+    });
 });
 
-// Clean up dead connections every 30 seconds (reduced frequency to save server CPU)
+/**
+ * GHOST PREVENTION:
+ * Clean up dead connections every 30 seconds to prevent "Room Full" errors.
+ */
 const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
-        if (ws.isAlive === false) return ws.terminate();
+        if (ws.isAlive === false) {
+            console.log("Terminating ghost connection");
+            return ws.terminate();
+        }
         ws.isAlive = false;
         ws.ping();
     });
