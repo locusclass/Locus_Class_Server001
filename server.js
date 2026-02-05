@@ -1,141 +1,131 @@
-const WebSocket = require('ws');
-const http = require('http');
-const url = require('url');
+const SIGNALING_URL =
+  "wss://presence-media-server-production.up.railway.app/ws";
 
-const PORT = process.env.PORT || 8080;
+let ws = null;
+let pc = null;
+let localStream = null;
+let audioEnabled = false;
 
-/**
- * Room management: Map<addressId, Set<WebSocket>>
- * Provides O(1) lookup for peer discovery.
- */
-const rooms = new Map();
+const joinBtn = document.getElementById("joinBtn");
+const audioBtn = document.getElementById("audioBtn");
+const remoteAudio = document.getElementById("remoteAudio");
 
-/**
- * HTTP Server for Health Checks
- */
-const server = http.createServer((req, res) => {
-    if (req.url === '/healthz' || req.url === '/health') {
-        res.writeHead(200);
-        return res.end('OK');
-    }
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('PRESENCE_SIGNAL_BRIDGE_V3_ACTIVE');
-});
+joinBtn.addEventListener("click", join);
+audioBtn.addEventListener("click", enableAudio);
 
-const wss = new WebSocket.Server({ server });
+async function join() {
+  const code = document.getElementById("code").value.trim();
+  if (!code) return;
 
-wss.on('connection', (ws, req) => {
-    const parameters = url.parse(req.url, true).query;
-    const addressId = parameters.address;
+  teardown();
 
-    // Safety: Close connection if no address provided
-    if (!addressId) {
-        console.log("Rejected: No Address ID");
-        return ws.terminate();
-    }
+  ws = new WebSocket(SIGNALING_URL);
 
-    ws.locusAddress = addressId;
-    ws.isAlive = true;
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: "join", address: code }));
+  };
 
-    // Initialize room if first arrival
-    if (!rooms.has(addressId)) {
-        rooms.set(addressId, new Set());
-    }
-    
-    const room = rooms.get(addressId);
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
 
-    // Limit: Max 2 peers per address
-    if (room.size >= 2) {
-        ws.send(JSON.stringify({ type: 'collapse', reason: 'ROOM_FULL' }));
-        return ws.terminate();
-    }
+    switch (msg.type) {
+      case "ready":
+        await startWebRTC(msg.role === "initiator");
+        audioBtn.disabled = false;
+        break;
 
-    room.add(ws);
-    console.log(`Peer joined [${addressId}]. Room size: ${room.size}`);
+      case "webrtc_offer":
+        await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({
+          type: "webrtc_answer",
+          sdp: answer.sdp,
+          sdpType: answer.type,
+        }));
+        break;
 
-    /**
-     * ROLE ASSIGNMENT:
-     * First peer to join is the 'polite' peer (Receiver).
-     * Second peer to join is the 'initiator' (Caller).
-     */
-    if (room.size === 1) {
-        ws.role = 'polite';
-    } else {
-        ws.role = 'initiator';
+      case "webrtc_answer":
+        await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+        break;
 
-        // Notify both peers to start handshaking
-        // Initiator will wait 200ms (client-side) before sending offer
-        room.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify({ 
-                    type: 'ready', 
-                    role: client.role 
-                }));
-            }
-        });
-    }
-
-    ws.on('pong', () => { ws.isAlive = true; });
-
-    ws.on('message', (rawData) => {
-        try {
-            // Check for heartbeat/ping
-            const dataStr = rawData.toString();
-            if (dataStr.includes('"type":"ping"')) {
-                return ws.send(JSON.stringify({ type: 'pong' }));
-            }
-
-            // RELAY: Send message to the other person in the room
-            room.forEach(client => {
-                if (client !== ws && client.readyState === WebSocket.OPEN) {
-                    client.send(rawData); 
-                }
-            });
-        } catch (e) {
-            console.error("Relay error:", e);
+      case "webrtc_ice":
+        if (msg.candidate) {
+          await pc.addIceCandidate({
+            candidate: msg.candidate,
+            sdpMid: msg.sdpMid,
+            sdpMLineIndex: msg.sdpMLineIndex,
+          });
         }
-    });
+        break;
 
-    ws.on('close', () => {
-        room.delete(ws);
-        console.log(`Peer left [${addressId}]. Remaining: ${room.size}`);
+      case "collapse":
+        teardown();
+        break;
+    }
+  };
 
-        // Notify remaining peer to collapse the UI
-        room.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify({ type: 'collapse', reason: 'peer_lost' }));
-            }
-        });
+  ws.onerror = teardown;
+  ws.onclose = teardown;
+}
 
-        // Clean up memory if room is empty
-        if (room.size === 0) {
-            rooms.delete(addressId);
-        }
-    });
+async function startWebRTC(initiator) {
+  localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  localStream.getAudioTracks().forEach(t => (t.enabled = false));
 
-    ws.on('error', (err) => {
-        console.error("WS Error:", err);
-        ws.terminate();
-    });
-});
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  });
 
-/**
- * GHOST PREVENTION:
- * Clean up dead connections every 30 seconds to prevent "Room Full" errors.
- */
-const interval = setInterval(() => {
-    wss.clients.forEach((ws) => {
-        if (ws.isAlive === false) {
-            console.log("Terminating ghost connection");
-            return ws.terminate();
-        }
-        ws.isAlive = false;
-        ws.ping();
-    });
-}, 30000);
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-wss.on('close', () => clearInterval(interval));
+  pc.ontrack = (e) => {
+    if (remoteAudio.srcObject !== e.streams[0]) {
+      remoteAudio.srcObject = e.streams[0];
+    }
+  };
 
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Presence Signaling Server running on port ${PORT}`);
-});
+  pc.onicecandidate = (e) => {
+    if (e.candidate && ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "webrtc_ice",
+        candidate: e.candidate.candidate,
+        sdpMid: e.candidate.sdpMid,
+        sdpMLineIndex: e.candidate.sdpMLineIndex,
+      }));
+    }
+  };
+
+  if (initiator) {
+    const offer = await pc.createOffer({ offerToReceiveAudio: true });
+    await pc.setLocalDescription(offer);
+    ws.send(JSON.stringify({
+      type: "webrtc_offer",
+      sdp: offer.sdp,
+      sdpType: offer.type,
+    }));
+  }
+}
+
+async function enableAudio() {
+  if (audioEnabled || !localStream) return;
+  audioEnabled = true;
+
+  remoteAudio.muted = false;
+  await remoteAudio.play().catch(() => {});
+
+  localStream.getAudioTracks().forEach(t => (t.enabled = true));
+}
+
+function teardown() {
+  audioBtn.disabled = true;
+  audioEnabled = false;
+
+  localStream?.getTracks().forEach(t => t.stop());
+  pc?.close();
+  ws?.close();
+
+  localStream = null;
+  pc = null;
+  ws = null;
+}
