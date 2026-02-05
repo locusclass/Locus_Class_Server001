@@ -1,131 +1,73 @@
-const SIGNALING_URL =
-  "wss://presence-media-server-production.up.railway.app/ws";
+const WebSocket = require('ws');
+const http = require('http');
 
-let ws = null;
-let pc = null;
-let localStream = null;
-let audioEnabled = false;
+// Use the port Railway provides, or 8080 locally
+const PORT = process.env.PORT || 8080;
+const server = http.createServer();
+const wss = new WebSocket.Server({ server });
 
-const joinBtn = document.getElementById("joinBtn");
-const audioBtn = document.getElementById("audioBtn");
-const remoteAudio = document.getElementById("remoteAudio");
+// Room storage: address -> Set of client sockets
+const rooms = new Map();
 
-joinBtn.addEventListener("click", join);
-audioBtn.addEventListener("click", enableAudio);
+wss.on('connection', (ws, req) => {
+    // Extract address from URL query: ws://url?address=123
+    const parameters = new URLSearchParams(req.url.split('?')[1]);
+    const address = parameters.get('address');
 
-async function join() {
-  const code = document.getElementById("code").value.trim();
-  if (!code) return;
+    if (!address) {
+        ws.close(1008, "Address required");
+        return;
+    }
 
-  teardown();
+    // Initialize room if it doesn't exist
+    if (!rooms.has(address)) {
+        rooms.set(address, new Set());
+    }
 
-  ws = new WebSocket(SIGNALING_URL);
+    const room = rooms.get(address);
 
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ type: "join", address: code }));
-  };
+    // Limit to 2 people per room for WebRTC P2P
+    if (room.size >= 2) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Room full' }));
+        ws.close();
+        return;
+    }
 
-  ws.onmessage = async (e) => {
-    const msg = JSON.parse(e.data);
+    room.add(ws);
+    console.log(`Peer joined room: ${address}. Total: ${room.size}`);
 
-    switch (msg.type) {
-      case "ready":
-        await startWebRTC(msg.role === "initiator");
-        audioBtn.disabled = false;
-        break;
+    // If there are now 2 people, tell them to start WebRTC
+    if (room.size === 2) {
+        const peers = Array.from(room);
+        // Randomly assign one as the initiator
+        peers[0].send(JSON.stringify({ type: 'ready', role: 'initiator' }));
+        peers[1].send(JSON.stringify({ type: 'ready', role: 'receiver' }));
+    }
 
-      case "webrtc_offer":
-        await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({
-          type: "webrtc_answer",
-          sdp: answer.sdp,
-          sdpType: answer.type,
-        }));
-        break;
+    ws.on('message', (data) => {
+        // Relay message to the other person in the room
+        const message = data.toString();
+        room.forEach(client => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+                client.send(message);
+            }
+        });
+    });
 
-      case "webrtc_answer":
-        await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
-        break;
-
-      case "webrtc_ice":
-        if (msg.candidate) {
-          await pc.addIceCandidate({
-            candidate: msg.candidate,
-            sdpMid: msg.sdpMid,
-            sdpMLineIndex: msg.sdpMLineIndex,
-          });
+    ws.on('close', () => {
+        room.delete(ws);
+        if (room.size === 0) {
+            rooms.delete(address);
+        } else {
+            // Tell remaining peer the other left
+            room.forEach(client => {
+                client.send(JSON.stringify({ type: 'collapse', reason: 'peer_disconnected' }));
+            });
         }
-        break;
+        console.log(`Peer left room: ${address}`);
+    });
+});
 
-      case "collapse":
-        teardown();
-        break;
-    }
-  };
-
-  ws.onerror = teardown;
-  ws.onclose = teardown;
-}
-
-async function startWebRTC(initiator) {
-  localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  localStream.getAudioTracks().forEach(t => (t.enabled = false));
-
-  pc = new RTCPeerConnection({
-    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-  });
-
-  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-  pc.ontrack = (e) => {
-    if (remoteAudio.srcObject !== e.streams[0]) {
-      remoteAudio.srcObject = e.streams[0];
-    }
-  };
-
-  pc.onicecandidate = (e) => {
-    if (e.candidate && ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: "webrtc_ice",
-        candidate: e.candidate.candidate,
-        sdpMid: e.candidate.sdpMid,
-        sdpMLineIndex: e.candidate.sdpMLineIndex,
-      }));
-    }
-  };
-
-  if (initiator) {
-    const offer = await pc.createOffer({ offerToReceiveAudio: true });
-    await pc.setLocalDescription(offer);
-    ws.send(JSON.stringify({
-      type: "webrtc_offer",
-      sdp: offer.sdp,
-      sdpType: offer.type,
-    }));
-  }
-}
-
-async function enableAudio() {
-  if (audioEnabled || !localStream) return;
-  audioEnabled = true;
-
-  remoteAudio.muted = false;
-  await remoteAudio.play().catch(() => {});
-
-  localStream.getAudioTracks().forEach(t => (t.enabled = true));
-}
-
-function teardown() {
-  audioBtn.disabled = true;
-  audioEnabled = false;
-
-  localStream?.getTracks().forEach(t => t.stop());
-  pc?.close();
-  ws?.close();
-
-  localStream = null;
-  pc = null;
-  ws = null;
-}
+server.listen(PORT, () => {
+    console.log(`Signaling server running on port ${PORT}`);
+});
